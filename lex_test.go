@@ -51,6 +51,14 @@ var lexTests = []lexTest{
 		tRang,
 		tEOF,
 	}},
+        {"privalversion", "<86>1", []item{
+                tLang,
+                {itemNumber, 0, "8"},
+                {itemNumber, 0, "6"},
+                tRang,
+                {itemNumber, 0, "1"},
+                tEOF,
+        }},
 }
 
 func collect(t *lexTest, left, right string) (items []item) {
