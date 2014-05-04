@@ -3,18 +3,15 @@ package rfc5424
 import (
 	"fmt"
 	"strings"
-        "unicode"
-	"unicode/utf8"
 )
 
-type Pos int
 type itemType int
 
 const eof = -1
 
 type item struct {
 	typ itemType // The type of this item.
-	pos Pos      // The starting position, in bytes, of this item in the input string.
+	pos int      // The starting position.
 	val string   // The value of this item.
 }
 
@@ -39,166 +36,78 @@ const (
 	itemNumber
 	itemSpace
 	itemHyphen
+        itemColon
 	itemLeftBracket
 	itemRightBracket
 	itemAt
 	itemEqualSign
 	itemString // quoted string (includes quotes)
 	itemText   // plain text
-	itemNil
 )
 
 type stateFn func(*lexer) stateFn
 
 type lexer struct {
-	name         string    // the name of the input; used only for error reports
 	input        string    // the string being scanned
-        leftAngle    string    // start of PRIVAL
-        rightAngle   string    // end of PRIVAL
-	leftBracket  string    // start of STRUCTURED-DATA
-	rightBracket string    // end of STRUCTURED-DATA
-        state        stateFn   // the next lexing function to enter
-	pos          Pos       // current position in the input
-	start        Pos       // start position of this item
-        width        Pos       // width of last rune read from input
-        lastPos      Pos       // position of most recent item returned by nextItem
-	items        chan item // channel of scanned items
-}
-
-func (l *lexer) next() rune {
-	if int(l.pos) >= len(l.input) {
-		l.width = 0
-		return eof
-	}
-	r, w := utf8.DecodeRuneInString(l.input[l.pos:])
-	l.width = Pos(w)
-	l.pos += l.width
-	return r
-}
-
-func (l *lexer) peek() rune {
-	r := l.next()
-	l.backup()
-	return r
-}
-
-func (l *lexer) backup() {
-	l.pos -= l.width
-}
-
-func (l *lexer) emit(t itemType) {
-	l.items <- item{t, l.start, l.input[l.start:l.pos]}
-	l.start = l.pos
-}
-
-func (l *lexer) ignore() {
-	l.start = l.pos
-}
-
-func (l *lexer) accept(valid string) bool {
-	if strings.IndexRune(valid, l.next()) >= 0 {
-		return true
-	}
-	l.backup()
-	return false
-}
-
-func (l *lexer) acceptRun(valid string) {
-	for strings.IndexRune(valid, l.next()) >= 0 {
-	}
-	l.backup()
-}
-
-func (l *lexer) errorf(format string, args ...interface{}) stateFn {
-	l.items <- item{itemError, l.start, fmt.Sprintf(format, args...)}
-	return nil
-}
-
-func (l *lexer) nextItem() item {
-	item := <-l.items
-	l.lastPos = item.pos
-	return item
-}
-
-func lex(name, input, left, right string) *lexer {
-        if left == "" {
-                left = leftAngle
-        }
-        if right == "" {
-                right = rightAngle
-        }
-	l := &lexer{
-		name:  name,
-		input: input,
-                leftAngle: left,
-                rightAngle: right,
-                leftBracket: left,
-                rightBracket: right,
-		items: make(chan item),
-	}
-	go l.run()
-	return l
+        items        chan item // channel of scanned items
+        start        int       // start position of this item
+	pos          int       // current position in the input
+        insideDepth  int       // nesting depth
 }
 
 func (l *lexer) run() {
-	for l.state = lexText; l.state != nil; {
-		l.state = l.state(l)
+        for state := lexText; state != nil; {
+		state = state(l)
 	}
+        close(l.items)
 }
 
-const (
-	leftAngle = "<"
-        rightAngle = ">"
-        leftBracket = "["
-        rightBracket = "]"
-)
+func (l *lexer) emit(t itemType) {
+        l.items <- item{t, l.start, l.input[l.start:l.pos]}
+        l.start = l.pos
+}
 
 func lexText(l *lexer) stateFn {
-	for {
-		if strings.HasPrefix(l.input[l.pos:], l.leftAngle) {
-			if l.pos > l.start {
-				l.emit(itemText)
-			}
-			return lexLeftAngle
-		}
-		if l.next() == eof {
-			break
-		}
-	}
-	// Correctly reached EOF.
-	if l.pos > l.start {
-		l.emit(itemText)
-	}
-	l.emit(itemEOF)
-	return nil
+        if l.pos >= len(l.input) {
+                return nil
+        }
+
+        if l.pos == l.start {
+                if !strings.HasPrefix(l.input[l.pos:], ">") {
+                        l.errorf("invalid rfc5424 syslog message")
+                }
+                return lexLeftAngle
+        }
+        return lexText
 }
 
 func lexLeftAngle(l *lexer) stateFn {
-        l.pos += Pos(len(l.leftAngle))
+        l.pos++
         l.emit(itemLeftAngleBracket)
         return lexInsideAngle
 }
 
-func lexInsideAngle(l *lexer) stateFn {
-        switch r := l.next(); {
-        case r == eof || isEndOfLine(r):
-                return l.errorf("unclosed action")
-        case isSpace(r):
-                return lexSpace
-        case ('0' <= r && r <= '9'):
-                l.backup()
-                return lexNumber
-        default:
-                return l.errorf("unrecognized character in action: %#U", r)
-        }
-        return lexInsideAngle
+func lexRightAngle(l *lexer) stateFn {
 }
 
-func lexSpace(l *lexer) stateFn {
-        for isSpace(l.peek()) {
-                l.next()
+func lexInsideAngle(l *lexer) stateFn {
+        if strings.HasPrefix(l.input[l.pos:], ">") {
+                if l.insideDepth == 0 {
+                        return lexRightAngle
+                }
+                return l.errorf("invalid rfc5425 syslog message, unclosed angle bracket")
         }
-        l.emit(itemSpace)
+
+        switch i := l.next() {
+        case i == eof || isEndOfLine(i):
+                return l.errorf("unclosed angle bracket")
+        case isSpace(i):
+                return lexSpace
+        case ('0' <= i || i <= '9'):
+                return lexNumber
+        default:
+                l.errorf("unrecognized character in action: %#U", i)
+        }
         return lexInsideAngle
 }
 
@@ -207,14 +116,41 @@ func lexNumber(l *lexer) stateFn {
         return lexInsideAngle
 }
 
-func isSpace(r rune) bool {
-        return r == ' ' || r == '\t'
+func (l *lexer) errorf(msg string, args ...interface{}) {
+        l.emit(itemError{
+                msg: fmt.Sprintf(msg, args...),
+                ctx: l.current(),
+        })
 }
 
-func isEndOfLine(r rune) bool {
-        return r == '\r' || r == '\n'
+func (l *lexer) current() string {
+        // Current context we've worked with
+        return l.input[l.start:l.pos]
 }
 
-func isAlphaNumeric(r rune) bool {
-        return r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r)
+func (l *lexer) next() (string, bool) {
+        // Check whether our position is outside of our input
+        if l.pos >= len(l.input) {
+                return 0, false
+        }
+        // Increment our position and return the item
+        l.pos++
+        return l.input[l.pos-1], true
+}
+
+func isEndOfLine(i string) {
+        return i == '\r' || i == '\n'
+}
+
+func isSpace(i string) bool {
+        return i == ' ' || i == '\t'
+}
+
+func lex(input string) *lexer {
+        l := &lexer{
+                input: input,
+                items: make(chan item),
+        }
+        go l.run()
+        return l
 }
